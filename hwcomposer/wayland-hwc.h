@@ -86,6 +86,7 @@ static const char *INPUT_PIPE_NAME[INPUT_TOTAL] = {
 
 enum class GrallocType {
     GRALLOC_ANDROID,
+    GRALLOC_ARM,
     GRALLOC_GBM,
     GRALLOC_CROS,
     GRALLOC_DEFAULT

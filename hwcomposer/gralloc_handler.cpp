@@ -26,7 +26,9 @@
 #include "gralloc_handler.h"
 
 #include <cstdint>
+#include <climits>
 #include <memory>
+#include <vector>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -183,7 +185,10 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(wl_conn *conn, const buffer_meta
     if (drm_format < 0) {
         drm_format = ConvertHalFormatToDrm(conn, metadata.format);
     }
-    assert(drm_format >= 0);
+    if (drm_format < 0) {
+        ALOGE("Wayland DMA-BUF does not support HAL format %u", metadata.format);
+        return nullptr;
+    }
 
     zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(conn->dmabuf);
     zwp_linux_buffer_params_v1_add(params, prime_fd, 0, offset, byte_stride, modifier >> 32, modifier & 0xffffffff);
@@ -298,6 +303,59 @@ buffer_metadata get_buffer_metadata_cros(display *, hwc_layer_1_t *layer, size_t
             static_cast<uint32_t>(handle->droid_format)
     };
 }
+buffer_metadata get_buffer_metadata_arm(display *display, hwc_layer_1_t *layer, size_t pos) {
+    buffer_metadata metadata = get_buffer_metadata_generic(display, layer, pos);
+    if (!layer->handle) {
+        ALOGE("Arm gralloc layer has no buffer handle");
+        return metadata;
+    }
+
+    auto &mapper = android::GraphicBufferMapper::get();
+    uint64_t width = 0;
+    uint64_t height = 0;
+    android::ui::PixelFormat format{};
+    std::vector<android::ui::PlaneLayout> planes;
+    if (mapper.getWidth(layer->handle, &width) != android::OK ||
+        mapper.getHeight(layer->handle, &height) != android::OK ||
+        mapper.getPixelFormatRequested(layer->handle, &format) != android::OK ||
+        mapper.getPlaneLayouts(layer->handle, &planes) != android::OK ||
+        planes.empty() || planes[0].strideInBytes <= 0) {
+        ALOGE("Unable to read Arm gralloc buffer metadata");
+        return metadata;
+    }
+
+    uint32_t bytes_per_pixel;
+    switch (static_cast<uint32_t>(format)) {
+        case HAL_PIXEL_FORMAT_RGBA_8888:
+        case HAL_PIXEL_FORMAT_RGBX_8888:
+        case HAL_PIXEL_FORMAT_BGRA_8888:
+            bytes_per_pixel = 4;
+            break;
+        case HAL_PIXEL_FORMAT_RGB_888:
+            bytes_per_pixel = 3;
+            break;
+        case HAL_PIXEL_FORMAT_RGB_565:
+            bytes_per_pixel = 2;
+            break;
+        default:
+            ALOGE("Arm gralloc metadata has unsupported format %u",
+                  static_cast<uint32_t>(format));
+            return metadata;
+    }
+    if (width > UINT32_MAX || height > UINT32_MAX ||
+        static_cast<uint64_t>(planes[0].strideInBytes) % bytes_per_pixel != 0 ||
+        static_cast<uint64_t>(planes[0].strideInBytes) / bytes_per_pixel > UINT32_MAX) {
+        ALOGE("Arm gralloc metadata is outside the supported range");
+        return metadata;
+    }
+
+    return {
+        static_cast<uint32_t>(height),
+        static_cast<uint32_t>(width),
+        static_cast<uint32_t>(planes[0].strideInBytes / bytes_per_pixel),
+        static_cast<uint32_t>(format),
+    };
+}
 
 std::unique_ptr<buffer> create_buffer_generic(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
     return create_shm_wl_buffer(conn, metadata, handle);
@@ -310,8 +368,37 @@ std::unique_ptr<buffer> create_buffer_cros(wl_conn *conn, const buffer_metadata&
     auto *cros_handle = reinterpret_cast<const cros_gralloc_handle *>(handle);
     return create_dmabuf_wl_buffer(conn, metadata, cros_handle->fds[0], cros_handle->format, cros_handle->strides[0], cros_handle->offsets[0], cros_handle->format_modifier, handle);
 }
+std::unique_ptr<buffer> create_buffer_arm(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
+    // Arm's native handle places its shared DMA-BUF FD first. Read the public
+    // mapper metadata for the layout instead of depending on its private ABI.
+    if (!handle || handle->numFds < 2 || handle->data[0] < 0) {
+        ALOGE("Arm gralloc did not provide its DMA-BUF and attribute FDs");
+        return nullptr;
+    }
+    auto &mapper = android::GraphicBufferMapper::get();
+    uint32_t drm_format = 0;
+    uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+    std::vector<android::ui::PlaneLayout> planes;
+    if (mapper.getPixelFormatFourCC(handle, &drm_format) != android::OK ||
+        mapper.getPixelFormatModifier(handle, &modifier) != android::OK ||
+        mapper.getPlaneLayouts(handle, &planes) != android::OK ||
+        planes.empty() || planes[0].strideInBytes <= 0 ||
+        planes[0].strideInBytes > INT_MAX ||
+        planes[0].offsetInBytes < 0 || planes[0].offsetInBytes > INT_MAX) {
+        ALOGE("Unable to read Arm gralloc DMA-BUF layout");
+        return nullptr;
+    }
+    return create_dmabuf_wl_buffer(conn, metadata, handle->data[0], drm_format,
+                                   static_cast<int>(planes[0].strideInBytes),
+                                   static_cast<int>(planes[0].offsetInBytes), modifier, handle);
+}
 std::unique_ptr<buffer> create_buffer_android(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
     return create_android_wl_buffer(conn, metadata, handle);
+}
+std::unique_ptr<buffer> create_buffer_missing_arm_dmabuf(wl_conn *conn __unused, const buffer_metadata& metadata, buffer_handle_t handle) {
+    ALOGE("GRALLOC_ARM selected but Wayland compositor lacks DMA-BUF v3; refusing SHM fallback for format=%u stride=%u handle=%p",
+          metadata.format, metadata.pixel_stride, handle);
+    return nullptr;
 }
 // SHM cannot present gralloc-android buffers, so fail loudly instead of
 // falling back to it and rendering garbage.
@@ -432,6 +519,8 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
             return get_buffer_metadata_gbm;
         case GrallocType::GRALLOC_CROS:
             return get_buffer_metadata_cros;
+        case GrallocType::GRALLOC_ARM:
+            return get_buffer_metadata_arm;
         case GrallocType::GRALLOC_ANDROID:
         case GrallocType::GRALLOC_DEFAULT:
             return get_buffer_metadata_generic;
@@ -445,6 +534,10 @@ gralloc_handler::create_buffer_func gralloc_handler::select_create_buffer_impl(w
         return create_buffer_gbm;
     } else if (gralloc_type == GrallocType::GRALLOC_CROS && conn->dmabuf) {
         return create_buffer_cros;
+    } else if (gralloc_type == GrallocType::GRALLOC_ARM && conn->dmabuf) {
+        return create_buffer_arm;
+    } else if (gralloc_type == GrallocType::GRALLOC_ARM) {
+        return create_buffer_missing_arm_dmabuf;
     } else if (gralloc_type == GrallocType::GRALLOC_ANDROID) {
         if (conn->android_wlegl)
             return create_buffer_android;
