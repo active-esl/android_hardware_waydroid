@@ -144,6 +144,12 @@ struct buffer {
 
     buffer_handle_t handle = nullptr;
     buffer_metadata metadata {};
+    /* Native handle addresses are recycled by SurfaceFlinger.  Keep the
+     * dma-buf identity as well so a same-shaped replacement cannot reuse a
+     * wl_buffer that still imports the old allocation. */
+    uint64_t dmabuf_device = 0;
+    uint64_t dmabuf_inode = 0;
+    bool dmabuf_identity_valid = false;
 
     bool isShm = false;
     void *shm_data = nullptr;
