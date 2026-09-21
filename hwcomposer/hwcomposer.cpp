@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <sys/socket.h>
@@ -88,13 +89,41 @@ namespace {
         return src;
     }
 
-    std::shared_ptr<buffer> find_cached_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata &metadata, buffer_handle_t handle) {
+    struct dmabuf_identity {
+        uint64_t device = 0;
+        uint64_t inode = 0;
+        bool valid = false;
+    };
+
+    static dmabuf_identity get_dmabuf_identity(buffer_handle_t handle) {
+        struct stat st {};
+        if (!handle || handle->numFds <= 0 || fstat(handle->data[0], &st) != 0)
+            return {};
+        return {
+            static_cast<uint64_t>(st.st_dev),
+            static_cast<uint64_t>(st.st_ino),
+            true,
+        };
+    }
+
+    std::shared_ptr<buffer> find_cached_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata &metadata, buffer_handle_t handle, const dmabuf_identity &identity) {
         auto it = pdev->display->ctl->buffer_map.find(handle);
         if (it != pdev->display->ctl->buffer_map.end()) {
-            /* FIXME We can't be sure that our cached buffer actually refers to the buffer corresponding to the given handle
-             * It's possible that a new buffer got the same handle after the old one was destroyed
-             * At least check for the metadata to match. This way this situation is hopefully unlikely */
-            if (it->second->metadata != metadata) {
+            if (it->second->metadata != metadata ||
+                !identity.valid || !it->second->dmabuf_identity_valid ||
+                it->second->dmabuf_device != identity.device ||
+                it->second->dmabuf_inode != identity.inode) {
+                if (identity.valid && it->second->dmabuf_identity_valid &&
+                    (it->second->dmabuf_device != identity.device ||
+                     it->second->dmabuf_inode != identity.inode)) {
+                    ALOGI("get_wl_buffer: native handle %p was recycled "
+                          "(%ju:%ju -> %ju:%ju)",
+                          handle,
+                          static_cast<uintmax_t>(it->second->dmabuf_device),
+                          static_cast<uintmax_t>(it->second->dmabuf_inode),
+                          static_cast<uintmax_t>(identity.device),
+                          static_cast<uintmax_t>(identity.inode));
+                }
                 pdev->display->ctl->buffer_map.erase(it);
             } else {
                 return it->second;
@@ -118,7 +147,9 @@ namespace {
                   pos, pdev->display->layer_handles_ext.size());
             return nullptr;
         }
-        std::shared_ptr<buffer> buf = find_cached_buffer(pdev, metadata, layer->handle);
+        const dmabuf_identity identity = get_dmabuf_identity(layer->handle);
+        std::shared_ptr<buffer> buf = find_cached_buffer(pdev, metadata, layer->handle,
+                                                        identity);
 
         if (!buf) {
             std::unique_ptr<buffer> result;
@@ -130,6 +161,9 @@ namespace {
                 ALOGE("failed to create a wayland buffer");
                 return nullptr;
             }
+            result->dmabuf_device = identity.device;
+            result->dmabuf_inode = identity.inode;
+            result->dmabuf_identity_valid = identity.valid;
             auto emplace_result = pdev->display->ctl->buffer_map.emplace(layer->handle, std::shared_ptr<buffer>(std::move(result)));
             assert(emplace_result.second);
             buf = emplace_result.first->second;
