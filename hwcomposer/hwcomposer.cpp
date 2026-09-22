@@ -553,7 +553,6 @@ static void apply_surface_damage(hwc_layer_1 *hwc_layer, surface_context &surfac
 }
 
 static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, surface_context &surface_context, std::shared_ptr<buffer> buf = nullptr) {
-    constexpr int acquireWarningMS = 100;
     int res = -1;
 
     if (!buf) {
@@ -578,17 +577,7 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
         surface_context.set_buffer_scale(pdev->display->scale);
     }
 
-    // TODO: Implement explicit synchronization
-    if (hwc_layer->acquireFenceFd != -1) {
-        res = sync_wait(hwc_layer->acquireFenceFd, acquireWarningMS);
-        if (res < 0 && errno == ETIME) {
-            ALOGE("hwcomposer waited on fence %d for %d ms", hwc_layer->acquireFenceFd,
-                  acquireWarningMS);
-        }
-    } else {
-        res = 0;
-    }
-
+    res = 0;
     wl_surface_commit(surface_context.surface);
 
 out:
@@ -599,6 +588,9 @@ out:
 }
 
 int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, window *window) {
+    constexpr int acquireWarningMS = 100;
+    int res = 0;
+
     /* Dozing: what still arrives is the screen-off animation fading to black.
      * Attaching it blanks every card, which is what users report as "the
      * screen turns black after a few seconds". Keep the last real frame
@@ -609,6 +601,18 @@ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 
             close(hwc_layer->acquireFenceFd);
         }
         return 0;
+    }
+
+    /* Arm's producer may still be rendering when the native handle arrives.
+     * Wait before importing the DMA-BUF into Wayland: importing first and only
+     * waiting before commit lets the Mali/GBM path retain the previous frame
+     * when Android replaces the boot surface with its first application. */
+    if (hwc_layer->acquireFenceFd != -1) {
+        res = sync_wait(hwc_layer->acquireFenceFd, acquireWarningMS);
+        if (res < 0 && errno == ETIME) {
+            ALOGE("hwcomposer waited on fence %d for %d ms", hwc_layer->acquireFenceFd,
+                  acquireWarningMS);
+        }
     }
 
     std::shared_ptr<buffer> buf = get_wl_buffer(pdev, hwc_layer, hwc_layer_index);
@@ -655,7 +659,7 @@ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 
     window->snapshot_unavailable = false;
     window->snapshot_file_attempts = 0;
 
-    return 0;
+    return res;
 }
 
 static void reset_per_commit_state_window(waydroid_hwc_composer_device_1 *pdev) {
