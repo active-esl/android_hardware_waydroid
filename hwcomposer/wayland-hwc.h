@@ -410,6 +410,7 @@ struct window {
 
     void minimize();
     void set_maximize(bool enabled);
+    void set_fullscreen(bool enabled);
     void set_title(const char *title);
     void set_app_id(std::string appID);
 
@@ -749,6 +750,7 @@ struct display {
     std::unique_ptr<cursor_handler> cursor_handler;
 
     bool isMaximized;
+    bool isFullscreen;
     sp<IWaydroidTask> task;
 
     const hwc_procs_t *procs;

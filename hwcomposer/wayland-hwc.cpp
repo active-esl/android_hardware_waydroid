@@ -917,6 +917,25 @@ void window::set_maximize(bool enabled) {
     }
 }
 
+void window::set_fullscreen(bool enabled) {
+    if (xdg_toplevel) {
+        if (enabled) {
+            xdg_toplevel_set_fullscreen(xdg_toplevel, conn->output);
+        } else {
+            xdg_toplevel_unset_fullscreen(xdg_toplevel);
+        }
+    } else {
+        assert(shell_surface);
+        if (enabled) {
+            wl_shell_surface_set_fullscreen(shell_surface,
+                                            WL_SHELL_SURFACE_FULLSCREEN_METHOD_DEFAULT,
+                                            0, conn->output);
+        } else {
+            wl_shell_surface_set_toplevel(shell_surface);
+        }
+    }
+}
+
 void window::set_title(const char* title) {
     if (xdg_toplevel) {
         xdg_toplevel_set_title(xdg_toplevel, title);
@@ -1098,7 +1117,9 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
      * yet sent is missing from the creation params. qtmir snapshots app_id at
      * surface creation and ignores later changes, leaving the window
      * mislabeled under the generic "Waydroid" app. */
-    if (display->isMaximized || calibrating) {
+    if (display->isFullscreen && conn->is_ctl) {
+        window->set_fullscreen(true);
+    } else if (display->isMaximized || calibrating) {
         window->set_maximize(true);
     }
 
@@ -4065,6 +4086,7 @@ create_display(const char *gralloc)
     display->gtype = get_gralloc_type(gralloc);
     display->refresh = 0;
     display->isMaximized = true;
+    display->isFullscreen = property_get_bool("persist.waydroid.fullscreen", false);
 
     sem_init(&display->egl_go, 0, 0);
     sem_init(&display->egl_done, 0, 0);
